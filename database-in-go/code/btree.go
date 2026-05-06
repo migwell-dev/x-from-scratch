@@ -435,10 +435,10 @@ func nodeInsert(
 	knode = treeInsert(tree, knode, key, val)
 
 	// Split child if needed (may return 1, 2, or 3 nodes)
-	nsplit, splited := nodeSplit3(knode)
+	nsplit, splitted := nodeSplit3(knode)
 
 	// Replace the old child with new split nodes
-	nodeReplaceKidN(tree, new, node, idx, splited[:nsplit]...)
+	nodeReplaceKidN(tree, new, node, idx, splitted[:nsplit]...)
 }
 
 // Splits a node into two nodes (left, right)
@@ -535,4 +535,206 @@ func nodeReplaceKidN(
 		idx+1,
 		old.nkeys()-(idx+1),
 	)
+}
+
+// DELETION
+
+// Removes a key from a leaf node
+//
+// Takes in a new node and copies keys [:idx] and [idx+1:]
+func leafDelete(new BNode, old BNode, idx uint16) {
+	new.setHeader(old.btype(), old.nkeys()-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendRange(new, old, idx, idx+1, old.nkeys()-(idx+1))
+}
+
+func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
+	// recurse into child node
+	kptr := node.getPtr(idx)
+	updated := treeDelete(tree, tree.get(kptr), key)
+	if len(updated.data) == 0 {
+		return BNode{} // not found
+	}
+	tree.del(kptr)
+
+	new := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+	// check for merging
+	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
+	switch {
+	case mergeDir < 0: // left
+		merged := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getPtr(idx - 1))
+		nodeReplace2Kid(new, node, idx-1, tree.new(merged), merged.getKey(0))
+	case mergeDir > 0:
+		merged := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		nodeMerge(merged, updated, sibling)
+		tree.del(node.getPtr(idx + 1))
+		nodeReplace2Kid(new, node, idx, tree.new(merged), merged.getKey(0))
+	case mergeDir == 0:
+		if updated.nkeys() <= 0 {
+			panic("no keys in node")
+		}
+		nodeReplaceKidN(tree, new, node, idx, updated)
+	}
+	return new
+}
+
+func nodeReplace2Kid(
+	new BNode, node BNode,
+	idx uint16, ptr uint64, key []byte,
+) {
+	new.setHeader(node.btype(), node.nkeys()-1)
+	nodeAppendRange(new, node, 0, 0, idx)
+	nodeAppendKV(new, idx, ptr, key, nil)
+	nodeAppendRange(
+		new,
+		node,
+		idx+1,                // destination (shifted left by 1)
+		idx+2,                // source (skip two old children)
+		node.nkeys()-(idx+2), // number of remaining entries
+	)
+}
+
+func nodeMerge(new BNode, left BNode, right BNode) {
+	new.setHeader(left.btype(), left.nkeys()+right.nkeys())
+	nodeAppendRange(new, left, 0, 0, left.nkeys())
+	nodeAppendRange(new, right, left.nkeys(), 0, right.nkeys())
+}
+
+func shouldMerge(
+	tree *BTree, node BNode,
+	idx uint16, updated BNode,
+) (int, BNode) {
+	// arbitrary condition to check node size for merging
+	if updated.nbytes() > BTREE_PAGE_SIZE/4 {
+		return 0, BNode{}
+	}
+
+	if idx > 0 {
+		sibling := tree.get(node.getPtr(idx - 1))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return -1, sibling
+		}
+	}
+
+	if idx+1 < node.nkeys() {
+		sibling := tree.get(node.getPtr(idx + 1))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return +1, sibling
+		}
+	}
+	return 0, BNode{}
+}
+
+func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+	idx := nodeLookup(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		if !bytes.Equal(key, node.getKey(idx)) {
+			return BNode{} // not found
+		}
+		// delete the key in the leaf
+		new := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		leafDelete(new, node, idx)
+		return new
+	case BNODE_NODE:
+		return nodeDelete(tree, node, idx, key)
+	default:
+		panic("node with invalid type")
+	}
+
+}
+
+func (tree *BTree) Delete(key []byte) bool {
+	if len(key) == 0 || len(key) > BTREE_MAX_KEY_SIZE {
+		panic("invalid key length")
+	}
+	if tree.root == 0 {
+		return false
+	}
+
+	updated := treeDelete(tree, tree.get(tree.root), key)
+	if len(updated.data) == 0 {
+		return false // not found
+	}
+
+	tree.del(tree.root)
+	if updated.btype() == BNODE_NODE && updated.nkeys() == 1 {
+		// remove a level
+		tree.root = updated.getPtr(0)
+	} else {
+		tree.root = tree.new(updated)
+	}
+	return true
+}
+
+func (tree *BTree) Get(key []byte) ([]byte, bool) {
+	if tree.root == 0 {
+		return nil, false
+	}
+
+	node := tree.get(tree.root)
+
+	for {
+		idx := nodeLookup(node, key)
+
+		switch node.btype() {
+
+		case BNODE_LEAF:
+			// check if key actually exists at idx
+			if idx < node.nkeys() && bytes.Equal(node.getKey(idx), key) {
+				return node.getVal(idx), true
+			}
+			return nil, false
+
+		case BNODE_NODE:
+			// follow pointer to child node
+			ptr := node.getPtr(idx)
+			node = tree.get(ptr)
+
+		default:
+			panic("unknown node type")
+		}
+	}
+}
+
+func (tree *BTree) Insert(key []byte, val []byte) {
+	if len(key) == 0 ||
+		len(key) > BTREE_MAX_KEY_SIZE ||
+		len(val) > BTREE_MAX_VAL_SIZE {
+		panic("invalid size for key or val")
+	}
+
+	if tree.root == 0 {
+		// create first node
+		root := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		root.setHeader(BNODE_LEAF, 2)
+		// dummy key to make the tree balanced
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, key, val)
+		tree.root = tree.new(root)
+	}
+
+	node := tree.get(tree.root)
+	tree.del(tree.root)
+
+	// insert recursively
+	node = treeInsert(tree, node, key, val)
+	nsplit, splitted := nodeSplit3(node)
+	if nsplit > 1 {
+		// root was split, add next level
+		root := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		root.setHeader(BNODE_NODE, nsplit)
+		for i, knode := range splitted[:nsplit] {
+			ptr, key := tree.new(knode), knode.getKey(0)
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
+		tree.root = tree.new(root)
+	} else {
+		tree.root = tree.new(splitted[0])
+	}
 }
